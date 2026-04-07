@@ -86,8 +86,9 @@ export default function SettingsPage() {
     try {
       const res = await fetch("/api/auth/gmail");
       const json = await res.json();
-      if (json.url) {
-        window.location.href = json.url;
+      const url = json?.data?.url || json?.url;
+      if (url) {
+        window.location.href = url;
       }
     } catch {
       // ignore
