@@ -40,3 +40,6 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 ## SolidMotion Outreach App
 
 Automated outreach tool for SolidMotion.
+
+
+Deployed via solidmotion GitHub org.
