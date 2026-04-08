@@ -5,120 +5,93 @@ import { eq, sql, asc, count } from "drizzle-orm";
 import { isWithinWorkHours } from "@/lib/scheduling/scheduler";
 import { processNextStep } from "@/lib/agents/orchestrator";
 
+export const maxDuration = 60;
+
 export async function GET(request: NextRequest) {
   try {
-    // 1. Verify CRON_SECRET auth
     const authHeader = request.headers.get("authorization");
-
     if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-      return Response.json(
-        { error: "Unauthorized" },
-        { status: 401 }
-      );
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // 2. Check if within work hours
     if (!isWithinWorkHours()) {
       return Response.json({
-        data: {
-          status: "skipped",
-          reason: "Outside work hours (9:00-17:00 CET, Mon-Fri)",
-          processedAt: new Date().toISOString(),
-        },
+        data: { status: "skipped", reason: "Outside work hours (9:00-17:00 CET, Mon-Fri)" },
       });
     }
 
-    // 3. Load settings and check if active
-    const [config] = await db
-      .select()
-      .from(settings)
-      .where(eq(settings.id, 1));
-
+    const [config] = await db.select().from(settings).where(eq(settings.id, 1));
     if (!config || !config.active) {
       return Response.json({
-        data: {
-          status: "skipped",
-          reason: "Processing is not active",
-          processedAt: new Date().toISOString(),
-        },
+        data: { status: "skipped", reason: "Processing is not active" },
       });
     }
 
-    // 4. Count today's processed businesses
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-
     const [{ todayCount }] = await db
       .select({ todayCount: count() })
       .from(agentLogs)
       .where(sql`${agentLogs.createdAt} >= ${todayStart}`);
 
     const dailyLimit = config.dailyLimit ?? 20;
-
     if (todayCount >= dailyLimit) {
       return Response.json({
-        data: {
-          status: "skipped",
-          reason: `Daily limit reached (${todayCount}/${dailyLimit})`,
-          processedAt: new Date().toISOString(),
-        },
+        data: { status: "skipped", reason: `Daily limit reached (${todayCount}/${dailyLimit})` },
       });
     }
 
-    // 5. Find next business that needs processing
-    const processableStatuses = [
-      "discovered",
-      "researching",
-      "designing",
-      "copywriting",
-      "reviewing",
-    ];
+    // Process multiple businesses in a loop (up to 50 seconds)
+    const startTime = Date.now();
+    const maxRunMs = 50000; // 50 seconds max to stay within 60s limit
+    const results: Array<{ businessId: number; name: string; previousStatus: string; result: unknown }> = [];
+    let processed = 0;
 
-    const [nextBusiness] = await db
-      .select()
-      .from(businesses)
-      .where(
-        sql`${businesses.status} IN (${sql.join(
-          processableStatuses.map((s) => sql`${s}`),
-          sql`, `
-        )})`
-      )
-      .orderBy(asc(businesses.updatedAt))
-      .limit(1);
+    const processableStatuses = ["discovered", "researching", "designing", "copywriting", "reviewing"];
 
-    if (!nextBusiness) {
-      return Response.json({
-        data: {
-          status: "idle",
-          reason: "No businesses need processing",
-          todayProcessed: todayCount,
-          dailyLimit,
-          processedAt: new Date().toISOString(),
-        },
-      });
+    while (Date.now() - startTime < maxRunMs && (todayCount + processed) < dailyLimit) {
+      const [nextBusiness] = await db
+        .select()
+        .from(businesses)
+        .where(
+          sql`${businesses.status} IN (${sql.join(
+            processableStatuses.map((s) => sql`${s}`),
+            sql`, `
+          )})`
+        )
+        .orderBy(asc(businesses.updatedAt))
+        .limit(1);
+
+      if (!nextBusiness) break;
+
+      try {
+        const result = await processNextStep(nextBusiness.id);
+        results.push({
+          businessId: nextBusiness.id,
+          name: nextBusiness.name,
+          previousStatus: nextBusiness.status,
+          result,
+        });
+        processed++;
+      } catch (err) {
+        console.error(`Failed to process business ${nextBusiness.id}:`, err);
+        break; // Stop on error to avoid cascading failures
+      }
     }
 
-    // 6. Run the orchestrator
-    const result = await processNextStep(nextBusiness.id);
-
-    // 7. Return summary
     return Response.json({
       data: {
-        status: "completed",
-        businessId: nextBusiness.id,
-        businessName: nextBusiness.name,
-        previousStatus: nextBusiness.status,
-        result,
-        todayProcessed: todayCount + 1,
+        status: processed > 0 ? "completed" : "idle",
+        processed,
+        results,
+        todayProcessed: todayCount + processed,
         dailyLimit,
+        elapsedMs: Date.now() - startTime,
         processedAt: new Date().toISOString(),
       },
     });
   } catch (error) {
     console.error("Cron processing failed:", error);
-    return Response.json(
-      { error: "Cron processing failed" },
-      { status: 500 }
-    );
+    return Response.json({ error: "Cron processing failed" }, { status: 500 });
   }
 }
