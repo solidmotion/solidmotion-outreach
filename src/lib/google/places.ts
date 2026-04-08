@@ -36,13 +36,14 @@ export interface PlaceReview {
   };
 }
 
-export interface NearbySearchResponse {
+export interface TextSearchResponse {
   places: PlaceResult[];
   nextPageToken?: string;
 }
 
 /**
- * Search for businesses near a location using Google Places API (New).
+ * Search for businesses near a location using Google Places Text Search API.
+ * Uses textQuery instead of includedTypes so Dutch niche names work as search terms.
  */
 export async function searchBusinesses(
   niche: string,
@@ -53,7 +54,7 @@ export async function searchBusinesses(
   const apiKey = getApiKey();
   const radiusMeters = radiusKm * 1000;
 
-  const response = await fetch(`${PLACES_API_BASE}:searchNearby`, {
+  const response = await fetch(`${PLACES_API_BASE}:searchText`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -62,8 +63,8 @@ export async function searchBusinesses(
         "places.id,places.displayName,places.formattedAddress,places.location,places.websiteUri,places.nationalPhoneNumber,places.internationalPhoneNumber,places.rating,places.userRatingCount,places.businessStatus,places.types,places.primaryType",
     },
     body: JSON.stringify({
-      includedTypes: [niche],
-      locationRestriction: {
+      textQuery: niche,
+      locationBias: {
         circle: {
           center: { latitude: lat, longitude: lng },
           radius: radiusMeters,
@@ -81,7 +82,7 @@ export async function searchBusinesses(
     );
   }
 
-  const data: NearbySearchResponse = await response.json();
+  const data: TextSearchResponse = await response.json();
   return data.places || [];
 }
 
