@@ -371,6 +371,16 @@ async function updateLog(
 // Main entry point
 // ---------------------------------------------------------------------------
 
+/**
+ * Process exactly ONE agent step for a business.
+ *
+ * Instead of running all agents in a pipeline phase at once (which can exceed
+ * Vercel function timeouts), this runs a single agent, then returns.
+ * The caller (frontend) should loop until the business reaches a terminal status.
+ *
+ * It checks previous logs to skip agents that already succeeded, and only
+ * advances the business status once ALL agents in the current phase are done.
+ */
 export async function processNextStep(
   businessId: number
 ): Promise<StepResult> {
@@ -403,138 +413,203 @@ export async function processNextStep(
   }
 
   const { steps, nextStatus } = pipelineEntry;
-  let lastAgentName = steps[0].agentName;
-  let lastResult: AgentResult | null = null;
 
-  // 2. Run each step sequentially
-  for (const step of steps) {
-    lastAgentName = step.agentName;
+  // 2. Load previous logs
+  const logs = await getPreviousLogs(businessId);
 
-    // Reload logs each iteration so sequential steps see previous outputs
-    const logs = await getPreviousLogs(businessId);
-    const userMessage = buildUserMessage(step.agentName, business, logs);
-
-    // Insert log with "running" status
-    const logId = await insertLog(
-      businessId,
-      step.agentName,
-      step.model,
-      userMessage.slice(0, 500)
-    );
-
-    console.log(
-      `[orchestrator] Running agent "${step.agentName}" for business ${businessId} (status: ${currentStatus})`
-    );
-
-    // Run the agent
-    const result = await runAgent({
-      agentName: step.agentName,
-      businessId,
-      systemPrompt: step.systemPrompt,
-      userMessage,
-      model: step.model,
-      maxTokens: step.maxTokens,
-    });
-
-    // Update log with result
-    await updateLog(logId, result);
-    lastResult = result;
-
-    // If an error occurred, stop the pipeline for this business
-    if (result.error) {
-      return {
-        success: false,
-        newStatus: currentStatus,
-        agentName: step.agentName,
-        error: result.error,
-      };
-    }
-
-    // --- Special handling per agent ---
-
-    // After scrape: update business fields from parsed output
-    if (step.agentName === "scrape") {
-      try {
-        const parsed = JSON.parse(result.content);
-        await db
-          .update(businesses)
-          .set({
-            contactPerson: parsed.contactPerson ?? business.contactPerson,
-            phone: parsed.phone ?? business.phone,
-            email: parsed.email ?? business.email,
-            websiteUrl: parsed.websiteUrl ?? business.websiteUrl,
-            websiteQuality: parsed.websiteQuality ?? business.websiteQuality,
-            address: parsed.address ?? business.address,
-            city: parsed.city ?? business.city,
-            updatedAt: new Date(),
-          })
-          .where(eq(businesses.id, businessId));
-
-        // If the scrape agent says this is not a candidate, mark as rejected
-        if (parsed.isCandidate === false) {
-          await db
-            .update(businesses)
-            .set({ status: "rejected", updatedAt: new Date() })
-            .where(eq(businesses.id, businessId));
-          return {
-            success: true,
-            newStatus: "rejected",
-            agentName: "scrape",
-          };
-        }
-      } catch {
-        // If JSON parsing fails, continue anyway
-        console.warn("[orchestrator] Could not parse scrape output as JSON");
-      }
-    }
-
-    // After design-1: store website HTML in campaigns table
-    if (step.agentName === "design-1") {
+  // Clean up stuck "running" logs from previous function timeouts
+  for (const log of logs) {
+    if (log.status === "running") {
       await db
-        .insert(campaigns)
-        .values({
-          businessId,
-          demoWebsiteHtml: result.content,
-          status: "pending",
+        .update(agentLogs)
+        .set({
+          status: "error",
+          errorMessage: "Function timeout (cleaned up)",
+          durationMs: 0,
         })
-        .onConflictDoUpdate({
-          target: campaigns.businessId,
-          set: { demoWebsiteHtml: result.content },
-        });
-    }
-
-    // After design-2: store email HTML in campaigns table
-    if (step.agentName === "design-2") {
-      await db
-        .update(campaigns)
-        .set({ emailHtml: result.content })
-        .where(eq(campaigns.businessId, businessId));
-    }
-
-    // After copywrite-2: store email copy in campaigns table
-    if (step.agentName === "copywrite-2") {
-      try {
-        const parsed = JSON.parse(result.content);
-        await db
-          .update(campaigns)
-          .set({
-            emailSubject: parsed.subject,
-            emailPlainText: parsed.plainText,
-          })
-          .where(eq(campaigns.businessId, businessId));
-      } catch {
-        console.warn("[orchestrator] Could not parse copywrite-2 output as JSON");
-      }
+        .where(eq(agentLogs.id, log.id));
     }
   }
 
-  // 3. Determine the final next status
+  // 3. Determine which agents in this phase already succeeded
+  const successfulAgents = new Set(
+    logs
+      .filter((l) => l.status === "success")
+      .map((l) => l.agentName)
+  );
+
+  const pendingSteps = steps.filter(
+    (s) => !successfulAgents.has(s.agentName)
+  );
+
+  // If all agents in this phase already ran, just advance status
+  if (pendingSteps.length === 0) {
+    const lastAgentName = steps[steps.length - 1].agentName;
+    const lastOutput = findLogOutput(logs, lastAgentName);
+
+    const finalStatus = await advanceBusinessStatus(
+      business,
+      businessId,
+      currentStatus,
+      nextStatus,
+      lastOutput
+    );
+
+    return {
+      success: true,
+      newStatus: finalStatus,
+      agentName: lastAgentName,
+    };
+  }
+
+  // 4. Run ONLY the first pending step
+  const step = pendingSteps[0];
+  const freshLogs = await getPreviousLogs(businessId);
+  const userMessage = buildUserMessage(step.agentName, business, freshLogs);
+
+  const logId = await insertLog(
+    businessId,
+    step.agentName,
+    step.model,
+    userMessage.slice(0, 500)
+  );
+
+  console.log(
+    `[orchestrator] Running agent "${step.agentName}" for business ${businessId} (status: ${currentStatus})`
+  );
+
+  const result = await runAgent({
+    agentName: step.agentName,
+    businessId,
+    systemPrompt: step.systemPrompt,
+    userMessage,
+    model: step.model,
+    maxTokens: step.maxTokens,
+  });
+
+  await updateLog(logId, result);
+
+  if (result.error) {
+    return {
+      success: false,
+      newStatus: currentStatus,
+      agentName: step.agentName,
+      error: result.error,
+    };
+  }
+
+  // 5. Handle per-agent special logic
+  if (step.agentName === "scrape") {
+    try {
+      const parsed = JSON.parse(result.content);
+      await db
+        .update(businesses)
+        .set({
+          contactPerson: parsed.contactPerson ?? business.contactPerson,
+          phone: parsed.phone ?? business.phone,
+          email: parsed.email ?? business.email,
+          websiteUrl: parsed.websiteUrl ?? business.websiteUrl,
+          websiteQuality: parsed.websiteQuality ?? business.websiteQuality,
+          address: parsed.address ?? business.address,
+          city: parsed.city ?? business.city,
+          updatedAt: new Date(),
+        })
+        .where(eq(businesses.id, businessId));
+
+      if (parsed.isCandidate === false) {
+        await db
+          .update(businesses)
+          .set({ status: "rejected", updatedAt: new Date() })
+          .where(eq(businesses.id, businessId));
+        return {
+          success: true,
+          newStatus: "rejected",
+          agentName: "scrape",
+        };
+      }
+    } catch {
+      console.warn("[orchestrator] Could not parse scrape output as JSON");
+    }
+  }
+
+  if (step.agentName === "design-1") {
+    await db
+      .insert(campaigns)
+      .values({
+        businessId,
+        demoWebsiteHtml: result.content,
+        status: "pending",
+      })
+      .onConflictDoUpdate({
+        target: campaigns.businessId,
+        set: { demoWebsiteHtml: result.content },
+      });
+  }
+
+  if (step.agentName === "design-2") {
+    await db
+      .update(campaigns)
+      .set({ emailHtml: result.content })
+      .where(eq(campaigns.businessId, businessId));
+  }
+
+  if (step.agentName === "copywrite-2") {
+    try {
+      const parsed = JSON.parse(result.content);
+      await db
+        .update(campaigns)
+        .set({
+          emailSubject: parsed.subject,
+          emailPlainText: parsed.plainText,
+        })
+        .where(eq(campaigns.businessId, businessId));
+    } catch {
+      console.warn("[orchestrator] Could not parse copywrite-2 output as JSON");
+    }
+  }
+
+  // 6. If this was the last pending step, advance business status
+  if (pendingSteps.length === 1) {
+    const finalStatus = await advanceBusinessStatus(
+      business,
+      businessId,
+      currentStatus,
+      nextStatus,
+      result.content
+    );
+
+    return {
+      success: true,
+      newStatus: finalStatus,
+      agentName: step.agentName,
+    };
+  }
+
+  // More steps remain in this phase — stay at current status
+  return {
+    success: true,
+    newStatus: currentStatus,
+    agentName: step.agentName,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Status advancement helper
+// ---------------------------------------------------------------------------
+
+async function advanceBusinessStatus(
+  business: BusinessRow,
+  businessId: number,
+  currentStatus: string,
+  nextStatus: BusinessStatus,
+  lastAgentOutput: string | null
+): Promise<string> {
   let finalNextStatus: BusinessStatus = nextStatus;
 
-  // Special case: manager can reject, sending business back to designing
-  if (currentStatus === "reviewing" && lastResult) {
+  // Special case: manager can reject
+  if (currentStatus === "reviewing" && lastAgentOutput) {
     try {
-      const parsed = JSON.parse(lastResult.content);
+      const parsed = JSON.parse(lastAgentOutput);
       if (parsed.decision === "reject") {
         finalNextStatus = "designing";
       }
@@ -543,12 +618,11 @@ export async function processNextStep(
     }
   }
 
-  // Special case: secretary handles deployment
-  if (currentStatus === "ready" && lastResult && !lastResult.error) {
+  // Special case: secretary handles deployment + Gmail draft
+  if (currentStatus === "ready" && lastAgentOutput) {
     try {
-      const parsed = JSON.parse(lastResult.content);
+      const parsed = JSON.parse(lastAgentOutput);
 
-      // Deploy website to GitHub Pages
       const slug = parsed.deploymentSlug ?? `biz-${businessId}`;
       const websiteHtml = parsed.websiteHtml ?? "";
 
@@ -560,13 +634,11 @@ export async function processNextStep(
         console.error("[orchestrator] GitHub Pages deployment failed:", err);
       }
 
-      // Replace demo URL placeholder in email HTML
       const emailHtml = (parsed.emailHtml ?? "").replace(
         /\{\{DEMO_URL\}\}/g,
         demoUrl
       );
 
-      // Update campaign with final data
       await db
         .update(campaigns)
         .set({
@@ -582,7 +654,6 @@ export async function processNextStep(
         })
         .where(eq(campaigns.businessId, businessId));
 
-      // Create Gmail draft if we have the necessary credentials
       const recipientEmail = parsed.recipientEmail ?? business.email;
       if (recipientEmail) {
         try {
@@ -609,9 +680,7 @@ export async function processNextStep(
               })
               .where(eq(campaigns.businessId, businessId));
 
-            console.log(
-              `[orchestrator] Gmail draft created: ${draftId}`
-            );
+            console.log(`[orchestrator] Gmail draft created: ${draftId}`);
           } else {
             console.warn(
               "[orchestrator] No Gmail refresh token configured; skipping draft creation"
@@ -626,15 +695,10 @@ export async function processNextStep(
     }
   }
 
-  // 4. Update business status
   await db
     .update(businesses)
     .set({ status: finalNextStatus, updatedAt: new Date() })
     .where(eq(businesses.id, businessId));
 
-  return {
-    success: true,
-    newStatus: finalNextStatus,
-    agentName: lastAgentName,
-  };
+  return finalNextStatus;
 }
