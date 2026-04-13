@@ -3,12 +3,14 @@ import { businesses, settings, agentLogs } from "@/lib/db/schema";
 import { eq, sql, asc, count } from "drizzle-orm";
 import { processNextStep } from "@/lib/agents/orchestrator";
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 /**
  * POST /api/pipeline/process-next
- * Picks the next processable business and runs one agent step.
- * No auth required but checks if engine is active.
+ * 
+ * Picks the next processable business and runs it through ALL pipeline stages
+ * until it reaches "sent" status (or gets rejected/errors out).
+ * This means one call = one fully completed business with a Gmail draft.
  */
 export async function POST() {
   try {
@@ -20,23 +22,24 @@ export async function POST() {
       });
     }
 
-    // 2. Check daily limit
+    // 2. Check daily limit (counts fully completed businesses today)
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
-    const [{ todayCount }] = await db
-      .select({ todayCount: count() })
-      .from(agentLogs)
-      .where(sql`${agentLogs.createdAt} >= ${todayStart}`);
+
+    const completedToday = await db
+      .select({ id: businesses.id })
+      .from(businesses)
+      .where(sql`${businesses.status} = 'sent' AND ${businesses.updatedAt} >= ${todayStart}`);
 
     const dailyLimit = config.dailyLimit ?? 20;
-    if (todayCount >= dailyLimit) {
+    if (completedToday.length >= dailyLimit) {
       return Response.json({
-        data: { status: "limit", reason: `Daglimiet bereikt (${todayCount}/${dailyLimit})` },
+        data: { status: "limit", reason: `Daglimiet bereikt (${completedToday.length}/${dailyLimit})` },
       });
     }
 
-    // 3. Find next business
-    const processableStatuses = ["discovered", "researching", "designing", "copywriting", "reviewing"];
+    // 3. Find next business to process
+    const processableStatuses = ["discovered", "researching", "designing", "copywriting", "reviewing", "ready"];
     const [nextBusiness] = await db
       .select()
       .from(businesses)
@@ -55,17 +58,62 @@ export async function POST() {
       });
     }
 
-    // 4. Process one step
-    const result = await processNextStep(nextBusiness.id);
+    // 4. Process this business through ALL remaining pipeline stages
+    const stepsCompleted: string[] = [];
+    let currentBusiness = nextBusiness;
+    const terminalStatuses = ["sent", "rejected", "replied", "converted"];
+    const maxSteps = 10; // safety limit
+    let step = 0;
+
+    while (!terminalStatuses.includes(currentBusiness.status) && step < maxSteps) {
+      step++;
+      const previousStatus = currentBusiness.status;
+
+      try {
+        const result = await processNextStep(currentBusiness.id);
+        stepsCompleted.push(`${result.agentName}: ${previousStatus} → ${result.newStatus}`);
+
+        if (!result.success) {
+          return Response.json({
+            data: {
+              status: "error",
+              businessId: currentBusiness.id,
+              businessName: currentBusiness.name,
+              stepsCompleted,
+              error: result.error,
+            },
+          });
+        }
+
+        // Reload business to get updated status
+        const [updated] = await db
+          .select()
+          .from(businesses)
+          .where(eq(businesses.id, currentBusiness.id));
+        
+        if (!updated) break;
+        currentBusiness = updated;
+      } catch (err) {
+        return Response.json({
+          data: {
+            status: "error",
+            businessId: currentBusiness.id,
+            businessName: currentBusiness.name,
+            stepsCompleted,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    }
 
     return Response.json({
       data: {
-        status: "completed",
-        businessId: nextBusiness.id,
-        businessName: nextBusiness.name,
-        previousStatus: nextBusiness.status,
-        result,
-        todayProcessed: todayCount + 1,
+        status: currentBusiness.status === "sent" ? "completed" : "partial",
+        businessId: currentBusiness.id,
+        businessName: currentBusiness.name,
+        finalStatus: currentBusiness.status,
+        stepsCompleted,
+        completedToday: completedToday.length + (currentBusiness.status === "sent" ? 1 : 0),
         dailyLimit,
         processedAt: new Date().toISOString(),
       },
