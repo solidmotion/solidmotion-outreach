@@ -1,127 +1,72 @@
+import { type NextRequest } from "next/server";
 import { db } from "@/lib/db";
-import { businesses, settings, agentLogs } from "@/lib/db/schema";
-import { eq, sql, asc, count } from "drizzle-orm";
+import { businesses } from "@/lib/db/schema";
+import { sql, asc } from "drizzle-orm";
 import { processNextStep } from "@/lib/agents/orchestrator";
 
-export const maxDuration = 300;
+export const maxDuration = 60;
 
-/**
- * POST /api/pipeline/process-next
- * 
- * Picks the next processable business and runs it through ALL pipeline stages
- * until it reaches "sent" status (or gets rejected/errors out).
- * This means one call = one fully completed business with a Gmail draft.
- */
-export async function POST() {
+export async function POST(request: NextRequest) {
   try {
-    // 1. Check if engine is active
-    const [config] = await db.select().from(settings).where(eq(settings.id, 1));
-    if (!config || !config.active) {
-      return Response.json({
-        data: { status: "inactive", reason: "Outreach engine is niet actief" },
-      });
-    }
+    const body = await request.json().catch(() => ({}));
 
-    // 2. Check daily limit (counts fully completed businesses today)
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    let businessId = body.businessId ? parseInt(body.businessId, 10) : null;
 
-    const completedToday = await db
-      .select({ id: businesses.id })
-      .from(businesses)
-      .where(sql`${businesses.status} = 'sent' AND ${businesses.updatedAt} >= ${todayStart}`);
+    if (!businessId) {
+      // Find the next business that needs processing
+      const processableStatuses = [
+        "discovered",
+        "researching",
+        "designing",
+        "copywriting",
+        "reviewing",
+        "ready",
+      ];
 
-    const dailyLimit = config.dailyLimit ?? 20;
-    if (completedToday.length >= dailyLimit) {
-      return Response.json({
-        data: { status: "limit", reason: `Daglimiet bereikt (${completedToday.length}/${dailyLimit})` },
-      });
-    }
+      const [nextBusiness] = await db
+        .select()
+        .from(businesses)
+        .where(
+          sql`${businesses.status} IN (${sql.join(
+            processableStatuses.map((s) => sql`${s}`),
+            sql`, `
+          )})`
+        )
+        .orderBy(asc(businesses.updatedAt))
+        .limit(1);
 
-    // 3. Find next business to process
-    const processableStatuses = ["discovered", "researching", "designing", "copywriting", "reviewing", "ready"];
-    const [nextBusiness] = await db
-      .select()
-      .from(businesses)
-      .where(
-        sql`${businesses.status} IN (${sql.join(
-          processableStatuses.map((s) => sql`${s}`),
-          sql`, `
-        )})`
-      )
-      .orderBy(asc(businesses.updatedAt))
-      .limit(1);
-
-    if (!nextBusiness) {
-      return Response.json({
-        data: { status: "idle", reason: "Geen bedrijven om te verwerken" },
-      });
-    }
-
-    // 4. Process this business through ALL remaining pipeline stages
-    const stepsCompleted: string[] = [];
-    let currentBusiness = nextBusiness;
-    const terminalStatuses = ["sent", "rejected", "replied", "converted"];
-    const maxSteps = 10; // safety limit
-    let step = 0;
-
-    while (!terminalStatuses.includes(currentBusiness.status) && step < maxSteps) {
-      step++;
-      const previousStatus = currentBusiness.status;
-
-      try {
-        const result = await processNextStep(currentBusiness.id);
-        stepsCompleted.push(`${result.agentName}: ${previousStatus} → ${result.newStatus}`);
-
-        if (!result.success) {
-          return Response.json({
-            data: {
-              status: "error",
-              businessId: currentBusiness.id,
-              businessName: currentBusiness.name,
-              stepsCompleted,
-              error: result.error,
-            },
-          });
-        }
-
-        // Reload business to get updated status
-        const [updated] = await db
-          .select()
-          .from(businesses)
-          .where(eq(businesses.id, currentBusiness.id));
-        
-        if (!updated) break;
-        currentBusiness = updated;
-      } catch (err) {
+      if (!nextBusiness) {
         return Response.json({
           data: {
-            status: "error",
-            businessId: currentBusiness.id,
-            businessName: currentBusiness.name,
-            stepsCompleted,
-            error: err instanceof Error ? err.message : String(err),
+            status: "idle",
+            reason: "No businesses need processing",
           },
         });
       }
+
+      businessId = nextBusiness.id;
     }
+
+    // Run ONE agent step
+    const result = await processNextStep(businessId);
+
+    // Check if business reached a terminal status
+    const terminal = ["sent", "replied", "converted", "rejected"].includes(
+      result.newStatus
+    );
 
     return Response.json({
       data: {
-        status: currentBusiness.status === "sent" ? "completed" : "partial",
-        businessId: currentBusiness.id,
-        businessName: currentBusiness.name,
-        finalStatus: currentBusiness.status,
-        stepsCompleted,
-        completedToday: completedToday.length + (currentBusiness.status === "sent" ? 1 : 0),
-        dailyLimit,
+        businessId,
+        ...result,
+        terminal,
         processedAt: new Date().toISOString(),
       },
     });
   } catch (error) {
-    console.error("Process-next failed:", error);
+    console.error("Failed to process pipeline step:", error);
     return Response.json(
-      { error: "Verwerking mislukt: " + (error instanceof Error ? error.message : String(error)) },
+      { error: "Failed to process pipeline step" },
       { status: 500 }
     );
   }
