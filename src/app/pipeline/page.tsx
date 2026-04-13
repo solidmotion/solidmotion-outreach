@@ -142,13 +142,14 @@ export default function PipelinePage() {
         if (stopRef.current) break;
 
         try {
-          const res = await fetch("/api/pipeline/process-next", {
+          const res: Response = await fetch("/api/pipeline/process-next", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(businessId ? { businessId } : {}),
           });
 
-          const json = await res.json();
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const json: any = await res.json();
 
           if (!res.ok) {
             addLog(`Fout: ${json.error ?? "Onbekende fout"}`, "error");
