@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { Header } from "@/components/layout/header";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 
 interface Business {
   id: number;
@@ -61,14 +60,25 @@ function formatTimeAgo(dateStr?: string): string {
   return `${days}d geleden`;
 }
 
+interface LogEntry {
+  time: string;
+  message: string;
+  type: "info" | "success" | "error" | "warning";
+}
+
 export default function PipelinePage() {
   const [columns, setColumns] = useState<ColumnData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [processing, setProcessing] = useState(false);
-  const [processLog, setProcessLog] = useState<string[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [completedCount, setCompletedCount] = useState(0);
   const stopRef = useRef(false);
+
+  const addLog = (message: string, type: LogEntry["type"] = "info") => {
+    const time = new Date().toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    setLogs((prev) => [{ time, message, type }, ...prev]);
+  };
 
   const fetchData = useCallback(() => {
     fetch("/api/businesses?limit=200")
@@ -99,81 +109,131 @@ export default function PipelinePage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 10000);
+    const interval = setInterval(fetchData, 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const startProcessing = useCallback(async () => {
+  const processBusinesses = async () => {
     setProcessing(true);
     stopRef.current = false;
-    setProcessLog(["Pipeline gestart - elk bedrijf wordt volledig verwerkt (alle 9 agents)..."]);
+    setLogs([]);
     setCompletedCount(0);
 
-    let count = 0;
-    const dailyTarget = 20;
+    const TARGET = 20;
+    let completed = 0;
 
-    while (count < dailyTarget && !stopRef.current) {
-      setProcessLog((prev) => [...prev, `Bedrijf ${count + 1}/${dailyTarget} oppakken...`]);
+    addLog(`Start verwerking van ${TARGET} bedrijven...`, "info");
 
-      try {
-        const res = await fetch("/api/pipeline/process-next", { method: "POST" });
-        const json = await res.json();
-
-        if (!res.ok) {
-          setProcessLog((prev) => [...prev, "Fout: " + (json.error || "Onbekende fout")]);
-          break;
-        }
-
-        const d = json.data;
-
-        if (d.status === "completed") {
-          count++;
-          setCompletedCount(count);
-          const steps = (d.stepsCompleted || []).join(" > ");
-          setProcessLog((prev) => [
-            ...prev,
-            `✅ ${d.businessName}: KLAAR! (${steps})`,
-            `   ${d.completedToday}/${d.dailyLimit} vandaag verstuurd`,
-          ]);
-          fetchData();
-        } else if (d.status === "partial") {
-          setProcessLog((prev) => [
-            ...prev,
-            `⚠️ ${d.businessName}: gestopt bij "${d.finalStatus}" (nog niet klaar)`,
-            `   Stappen: ${(d.stepsCompleted || []).join(" > ")}`,
-          ]);
-          fetchData();
-        } else if (d.status === "error") {
-          setProcessLog((prev) => [
-            ...prev,
-            `❌ ${d.businessName || "Onbekend"}: Fout - ${d.error}`,
-            `   Stappen: ${(d.stepsCompleted || []).join(" > ")}`,
-          ]);
-          // Continue to next business despite error
-        } else if (d.status === "idle") {
-          setProcessLog((prev) => [...prev, "Geen bedrijven meer om te verwerken"]);
-          break;
-        } else if (d.status === "limit") {
-          setProcessLog((prev) => [...prev, d.reason]);
-          break;
-        } else if (d.status === "inactive") {
-          setProcessLog((prev) => [...prev, "Engine is niet actief - zet hem aan bij Instellingen"]);
-          break;
-        }
-      } catch {
-        setProcessLog((prev) => [...prev, "Netwerkfout - probeer opnieuw..."]);
+    for (let i = 0; i < TARGET; i++) {
+      if (stopRef.current) {
+        addLog("Verwerking gestopt door gebruiker.", "warning");
         break;
       }
+
+      addLog(`Zoek bedrijf ${i + 1}/${TARGET}...`, "info");
+
+      // Keep calling process-next for the same business until it reaches terminal status
+      let businessName = "";
+      let businessId: number | null = null;
+      let stepCount = 0;
+      const MAX_STEPS = 15; // Safety limit
+
+      while (stepCount < MAX_STEPS) {
+        if (stopRef.current) break;
+
+        try {
+          const res = await fetch("/api/pipeline/process-next", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(businessId ? { businessId } : {}),
+          });
+
+          const json = await res.json();
+
+          if (!res.ok) {
+            addLog(`Fout: ${json.error ?? "Onbekende fout"}`, "error");
+            break;
+          }
+
+          const data = json.data;
+
+          // No more businesses to process
+          if (data.status === "idle") {
+            addLog("Geen bedrijven meer om te verwerken.", "warning");
+            stopRef.current = true;
+            break;
+          }
+
+          // Track which business we're working on
+          if (!businessId) {
+            businessId = data.businessId;
+          }
+          if (!businessName && data.businessId) {
+            // Fetch business name
+            businessName = `#${data.businessId}`;
+          }
+
+          stepCount++;
+          const icon = data.success ? "✅" : "❌";
+          addLog(
+            `${icon} ${businessName} — ${data.agentName} → ${data.newStatus}`,
+            data.success ? "success" : "error"
+          );
+
+          // Refresh pipeline view
+          fetchData();
+
+          // Check if done (terminal status)
+          if (data.terminal) {
+            completed++;
+            setCompletedCount(completed);
+            addLog(
+              `🎉 ${businessName} volledig verwerkt! (${completed}/${TARGET})`,
+              "success"
+            );
+            break;
+          }
+
+          // If there was an error, move on to next business
+          if (!data.success) {
+            addLog(
+              `⚠️ ${businessName} overgeslagen wegens fout.`,
+              "warning"
+            );
+            break;
+          }
+        } catch (err) {
+          addLog(
+            `Netwerkfout: ${err instanceof Error ? err.message : "Onbekend"}`,
+            "error"
+          );
+          break;
+        }
+      }
+
+      if (stepCount >= MAX_STEPS) {
+        addLog(
+          `⚠️ ${businessName} — maximaal aantal stappen bereikt, ga door met volgende.`,
+          "warning"
+        );
+      }
+
+      // Reset for next business
+      businessId = null;
+      businessName = "";
     }
 
-    setProcessLog((prev) => [...prev, `Pipeline klaar: ${count} bedrijven volledig verwerkt`]);
+    addLog(
+      `Klaar! ${completed} bedrijven volledig verwerkt.`,
+      completed > 0 ? "success" : "warning"
+    );
     setProcessing(false);
-  }, [fetchData]);
+    fetchData();
+  };
 
-  const stopProcessing = useCallback(() => {
+  const handleStop = () => {
     stopRef.current = true;
-    setProcessLog((prev) => [...prev, "Stoppen na huidig bedrijf..."]);
-  }, []);
+  };
 
   if (loading) {
     return (
@@ -193,35 +253,54 @@ export default function PipelinePage() {
 
   return (
     <div>
-      <Header
-        title="Pipeline"
-        description="Volg de voortgang van elk bedrijf"
-        action={
-          processing ? (
-            <Button variant="danger" onClick={stopProcessing}>
-              Stop ({completedCount} klaar)
-            </Button>
-          ) : (
-            <Button variant="primary" onClick={startProcessing}>
-              Verwerken (20 bedrijven)
-            </Button>
-          )
-        }
-      />
+      <Header title="Pipeline" description="Volg de voortgang van elk bedrijf" />
 
-      {processLog.length > 0 && (
-        <Card padding="sm" className="mb-4">
-          <div className="max-h-48 overflow-y-auto text-xs font-mono space-y-0.5">
-            {processLog.map((log, i) => (
-              <p key={i} className={log.startsWith("✅") ? "text-green-600" : log.startsWith("❌") ? "text-red-500" : "text-text-secondary"}>
-                {log}
-              </p>
+      <div className="flex items-center gap-3 mb-4">
+        {!processing ? (
+          <button
+            onClick={processBusinesses}
+            className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors text-sm font-medium"
+          >
+            Verwerken (20 bedrijven)
+          </button>
+        ) : (
+          <button
+            onClick={handleStop}
+            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors text-sm font-medium"
+          >
+            Stoppen
+          </button>
+        )}
+        {processing && (
+          <span className="text-sm text-text-muted">
+            {completedCount}/20 bedrijven klaar...
+          </span>
+        )}
+      </div>
+
+      {logs.length > 0 && (
+        <div className="mb-4 bg-surface border border-border rounded-lg p-3 max-h-60 overflow-y-auto">
+          <div className="space-y-1">
+            {logs.map((log, i) => (
+              <div key={i} className="text-xs font-mono flex gap-2">
+                <span className="text-text-muted shrink-0">{log.time}</span>
+                <span
+                  className={
+                    log.type === "error"
+                      ? "text-red-500"
+                      : log.type === "success"
+                        ? "text-green-500"
+                        : log.type === "warning"
+                          ? "text-yellow-500"
+                          : "text-text-muted"
+                  }
+                >
+                  {log.message}
+                </span>
+              </div>
             ))}
-            {processing && (
-              <p className="text-primary animate-pulse">Bezig met verwerken...</p>
-            )}
           </div>
-        </Card>
+        </div>
       )}
 
       <div className="overflow-x-auto -mx-2 px-2 pb-4">
@@ -235,7 +314,7 @@ export default function PipelinePage() {
                   <Badge variant="outline">{col.businesses.length}</Badge>
                 </div>
               </div>
-              <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-340px)] pr-1">
+              <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-350px)] pr-1">
                 {col.businesses.map((biz) => (
                   <Card key={biz.id} padding="sm">
                     <p className="text-sm font-medium text-text">{biz.name}</p>
