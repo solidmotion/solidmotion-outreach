@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { businesses, agentLogs, campaigns, settings } from "@/lib/db/schema";
-import { eq, asc } from "drizzle-orm";
+import { eq, asc, inArray } from "drizzle-orm";
 import { runAgent } from "./runner";
 import type { AgentResult } from "./runner";
 import type { ModelKey } from "./client";
@@ -77,7 +77,7 @@ const PIPELINE: Record<
         agentName: "research-2",
         systemPrompt: RESEARCH_2_SYSTEM_PROMPT,
         model: "sonnet",
-        maxTokens: 4096,
+        maxTokens: 2048,
       },
       {
         agentName: "design-1",
@@ -418,17 +418,16 @@ export async function processNextStep(
   const logs = await getPreviousLogs(businessId);
 
   // Clean up stuck "running" logs from previous function timeouts
-  for (const log of logs) {
-    if (log.status === "running") {
-      await db
-        .update(agentLogs)
-        .set({
-          status: "error",
-          errorMessage: "Function timeout (cleaned up)",
-          durationMs: 0,
-        })
-        .where(eq(agentLogs.id, log.id));
-    }
+  const runningLogIds = logs.filter(l => l.status === "running").map(l => l.id);
+  if (runningLogIds.length > 0) {
+    await db
+      .update(agentLogs)
+      .set({
+        status: "error",
+        errorMessage: "Function timeout (cleaned up)",
+        durationMs: 0,
+      })
+      .where(inArray(agentLogs.id, runningLogIds));
   }
 
   // 3. Determine which agents in this phase already succeeded
@@ -438,8 +437,25 @@ export async function processNextStep(
       .map((l) => l.agentName)
   );
 
+  // Skip agents that have failed too many times (3+ retries)
+  const MAX_RETRIES = 3;
+  const errorCounts: Record<string, number> = {};
+  for (const log of logs) {
+    if (log.status === "error" || log.status === "running") {
+      errorCounts[log.agentName] = (errorCounts[log.agentName] || 0) + 1;
+    }
+  }
+
+  const skippedAgents = new Set<string>();
+  for (const step of steps) {
+    if (!successfulAgents.has(step.agentName) && (errorCounts[step.agentName] || 0) >= MAX_RETRIES) {
+      skippedAgents.add(step.agentName);
+      console.warn(`[orchestrator] Skipping agent "${step.agentName}" for business ${businessId} after ${errorCounts[step.agentName]} failures`);
+    }
+  }
+
   const pendingSteps = steps.filter(
-    (s) => !successfulAgents.has(s.agentName)
+    (s) => !successfulAgents.has(s.agentName) && !skippedAgents.has(s.agentName)
   );
 
   // If all agents in this phase already ran, just advance status
@@ -464,8 +480,7 @@ export async function processNextStep(
 
   // 4. Run ONLY the first pending step
   const step = pendingSteps[0];
-  const freshLogs = await getPreviousLogs(businessId);
-  const userMessage = buildUserMessage(step.agentName, business, freshLogs);
+  const userMessage = buildUserMessage(step.agentName, business, logs);
 
   const logId = await insertLog(
     businessId,
