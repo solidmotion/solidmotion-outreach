@@ -20,6 +20,7 @@ import { deployToGitHubPages } from "@/lib/github/pages";
 import { createDraft } from "@/lib/google/gmail";
 
 // ---------------------------------------------------------------------------
+// Updated: 2026-04-13 — email rejection rule + fast models
 // Types
 // ---------------------------------------------------------------------------
 
@@ -318,7 +319,7 @@ function buildUserMessage(
         `\n\n## Demo Website HTML\n${websiteHtml}`,
         `\n\n## Email Template HTML\n${emailHtml}`,
         `\n\n## Email Copy\n${emailCopy}`,
-        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ it will be replaced before sending.`,
+        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ it will be replaced before sending.`,
       ].join("");
     }
 
@@ -546,7 +547,7 @@ export async function processNextStep(
       // HARD RULE: No email = reject. Businesses MUST have an email to proceed.
       const finalEmail = parsed.email ?? business.email;
       if (!finalEmail) {
-        console.warn(`[orchestrator] Rejecting business ${businessId} — no email address found`);
+        console.warn(`[orchestrator] Rejecting business ${businessId} â no email address found`);
         await db
           .update(businesses)
           .set({ status: "rejected", updatedAt: new Date() })
@@ -555,7 +556,7 @@ export async function processNextStep(
           success: true,
           newStatus: "rejected",
           agentName: "scrape",
-          error: "No email address found — business rejected",
+          error: "No email address found â business rejected",
         };
       }
     } catch {
@@ -616,7 +617,7 @@ export async function processNextStep(
     };
   }
 
-  // More steps remain in this phase ÃÂÃÂ¢ÃÂÃÂÃÂÃÂ stay at current status
+  // More steps remain in this phase ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ stay at current status
   return {
     success: true,
     newStatus: currentStatus,
