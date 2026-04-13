@@ -83,7 +83,7 @@ const PIPELINE: Record<
         agentName: "design-1",
         systemPrompt: DESIGN_1_SYSTEM_PROMPT,
         model: "sonnet",
-        maxTokens: 16384,
+        maxTokens: 8192,
       },
       {
         agentName: "copywrite-1",
@@ -100,7 +100,7 @@ const PIPELINE: Record<
         agentName: "design-2",
         systemPrompt: DESIGN_2_SYSTEM_PROMPT,
         model: "sonnet",
-        maxTokens: 8192,
+        maxTokens: 4096,
       },
       {
         agentName: "copywrite-2",
@@ -129,7 +129,7 @@ const PIPELINE: Record<
         agentName: "secretary",
         systemPrompt: SECRETARY_SYSTEM_PROMPT,
         model: "haiku",
-        maxTokens: 16384,
+        maxTokens: 8192,
       },
     ],
     nextStatus: "sent",
@@ -318,7 +318,7 @@ function buildUserMessage(
         `\n\n## Demo Website HTML\n${websiteHtml}`,
         `\n\n## Email Template HTML\n${emailHtml}`,
         `\n\n## Email Copy\n${emailCopy}`,
-        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed — it will be replaced before sending.`,
+        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed â it will be replaced before sending.`,
       ].join("");
     }
 
@@ -600,7 +600,7 @@ export async function processNextStep(
     };
   }
 
-  // More steps remain in this phase — stay at current status
+  // More steps remain in this phase â stay at current status
   return {
     success: true,
     newStatus: currentStatus,
