@@ -88,7 +88,7 @@ const PIPELINE: Record<
       {
         agentName: "copywrite-1",
         systemPrompt: COPYWRITE_1_SYSTEM_PROMPT,
-        model: "sonnet",
+        model: "haiku",
         maxTokens: 4096,
       },
     ],
@@ -105,7 +105,7 @@ const PIPELINE: Record<
       {
         agentName: "copywrite-2",
         systemPrompt: COPYWRITE_2_SYSTEM_PROMPT,
-        model: "sonnet",
+        model: "haiku",
         maxTokens: 4096,
       },
     ],
@@ -116,8 +116,8 @@ const PIPELINE: Record<
       {
         agentName: "manager",
         systemPrompt: MANAGER_SYSTEM_PROMPT,
-        model: "opus",
-        maxTokens: 4096,
+        model: "sonnet",
+        maxTokens: 2048,
       },
     ],
     // nextStatus is dynamic: "ready" on approve, "designing" on reject
@@ -318,7 +318,7 @@ function buildUserMessage(
         `\n\n## Demo Website HTML\n${websiteHtml}`,
         `\n\n## Email Template HTML\n${emailHtml}`,
         `\n\n## Email Copy\n${emailCopy}`,
-        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed Ã¢ÂÂ it will be replaced before sending.`,
+        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed ÃÂ¢ÃÂÃÂ it will be replaced before sending.`,
       ].join("");
     }
 
@@ -600,7 +600,7 @@ export async function processNextStep(
     };
   }
 
-  // More steps remain in this phase Ã¢ÂÂ stay at current status
+  // More steps remain in this phase ÃÂ¢ÃÂÃÂ stay at current status
   return {
     success: true,
     newStatus: currentStatus,
