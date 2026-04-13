@@ -19,8 +19,16 @@ import { SECRETARY_SYSTEM_PROMPT } from "./prompts/secretary";
 import { deployToGitHubPages } from "@/lib/github/pages";
 import { createDraft } from "@/lib/google/gmail";
 
+/** Safely parse JSON that may be wrapped in markdown code blocks. */
+function safeParseJSON(raw: string): any {
+  let s = raw.trim();
+  s = s.replace(/^\`\`\`(?:json)?\s*\n?/i, "").replace(/\n?\s*\`\`\`\s*$/, "");
+  return JSON.parse(s);
+}
+
+
 // ---------------------------------------------------------------------------
-// Updated: 2026-04-13 — email rejection rule + fast models
+// Updated: 2026-04-13 â email rejection rule + fast models
 // Types
 // ---------------------------------------------------------------------------
 
@@ -319,7 +327,7 @@ function buildUserMessage(
         `\n\n## Demo Website HTML\n${websiteHtml}`,
         `\n\n## Email Template HTML\n${emailHtml}`,
         `\n\n## Email Copy\n${emailCopy}`,
-        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ it will be replaced before sending.`,
+        `\n\nThe demo website URL will be determined after GitHub Pages deployment. Use a placeholder like {{DEMO_URL}} if needed ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ it will be replaced before sending.`,
       ].join("");
     }
 
@@ -517,7 +525,7 @@ export async function processNextStep(
   // 5. Handle per-agent special logic
   if (step.agentName === "scrape") {
     try {
-      const parsed = JSON.parse(result.content);
+      const parsed = safeParseJSON(result.content);
       await db
         .update(businesses)
         .set({
@@ -547,7 +555,7 @@ export async function processNextStep(
       // HARD RULE: No email = reject. Businesses MUST have an email to proceed.
       const finalEmail = parsed.email ?? business.email;
       if (!finalEmail) {
-        console.warn(`[orchestrator] Rejecting business ${businessId} â no email address found`);
+        console.warn(`[orchestrator] Rejecting business ${businessId} Ã¢ÂÂ no email address found`);
         await db
           .update(businesses)
           .set({ status: "rejected", updatedAt: new Date() })
@@ -556,11 +564,21 @@ export async function processNextStep(
           success: true,
           newStatus: "rejected",
           agentName: "scrape",
-          error: "No email address found â business rejected",
+          error: "No email address found Ã¢ÂÂ business rejected",
         };
       }
-    } catch {
-      console.warn("[orchestrator] Could not parse scrape output as JSON");
+    } catch (err) {
+      console.warn("[orchestrator] Could not parse scrape output, rejecting:", err);
+      await db
+        .update(businesses)
+        .set({ status: "rejected", updatedAt: new Date() })
+        .where(eq(businesses.id, businessId));
+      return {
+        success: true,
+        newStatus: "rejected",
+        agentName: "scrape",
+        error: "Scrape output not valid JSON — business rejected",
+      };
     }
   }
 
@@ -587,7 +605,7 @@ export async function processNextStep(
 
   if (step.agentName === "copywrite-2") {
     try {
-      const parsed = JSON.parse(result.content);
+      const parsed = safeParseJSON(result.content);
       await db
         .update(campaigns)
         .set({
@@ -617,7 +635,7 @@ export async function processNextStep(
     };
   }
 
-  // More steps remain in this phase ÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ stay at current status
+  // More steps remain in this phase ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ¢ÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂÃÂ stay at current status
   return {
     success: true,
     newStatus: currentStatus,
@@ -641,7 +659,7 @@ async function advanceBusinessStatus(
   // Special case: manager can reject
   if (currentStatus === "reviewing" && lastAgentOutput) {
     try {
-      const parsed = JSON.parse(lastAgentOutput);
+      const parsed = safeParseJSON(lastAgentOutput);
       if (parsed.decision === "reject") {
         finalNextStatus = "designing";
       }
@@ -653,7 +671,7 @@ async function advanceBusinessStatus(
   // Special case: secretary handles deployment + Gmail draft
   if (currentStatus === "ready" && lastAgentOutput) {
     try {
-      const parsed = JSON.parse(lastAgentOutput);
+      const parsed = safeParseJSON(lastAgentOutput);
 
       const slug = parsed.deploymentSlug ?? `biz-${businessId}`;
       const websiteHtml = parsed.websiteHtml ?? "";
