@@ -67,8 +67,8 @@ export default function PipelinePage() {
   const [error, setError] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [processLog, setProcessLog] = useState<string[]>([]);
-  const [processedCount, setProcessedCount] = useState(0);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [completedCount, setCompletedCount] = useState(0);
+  const stopRef = useRef(false);
 
   const fetchData = useCallback(() => {
     fetch("/api/businesses?limit=200")
@@ -99,79 +99,80 @@ export default function PipelinePage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 15000);
+    const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  const processNext = useCallback(async () => {
-    try {
-      const res = await fetch("/api/pipeline/process-next", { method: "POST" });
-      const json = await res.json();
+  const startProcessing = useCallback(async () => {
+    setProcessing(true);
+    stopRef.current = false;
+    setProcessLog(["Pipeline gestart - elk bedrijf wordt volledig verwerkt (alle 9 agents)..."]);
+    setCompletedCount(0);
 
-      if (!res.ok) {
-        setProcessLog((prev) => [...prev, `Fout: ${json.error}`]);
-        return "error";
-      }
+    let count = 0;
+    const dailyTarget = 20;
 
-      const d = json.data;
-      if (d.status === "completed") {
-        setProcessedCount((c) => c + 1);
-        setProcessLog((prev) => [
-          ...prev,
-          `${d.businessName}: ${d.previousStatus} -> verwerkt (${d.todayProcessed}/${d.dailyLimit})`,
-        ]);
-        fetchData();
-        return "completed";
-      } else if (d.status === "idle") {
-        setProcessLog((prev) => [...prev, "Geen bedrijven meer om te verwerken"]);
-        return "idle";
-      } else if (d.status === "limit") {
-        setProcessLog((prev) => [...prev, d.reason]);
-        return "limit";
-      } else if (d.status === "inactive") {
-        setProcessLog((prev) => [...prev, "Engine is niet actief - zet hem aan bij Instellingen"]);
-        return "inactive";
+    while (count < dailyTarget && !stopRef.current) {
+      setProcessLog((prev) => [...prev, `Bedrijf ${count + 1}/${dailyTarget} oppakken...`]);
+
+      try {
+        const res = await fetch("/api/pipeline/process-next", { method: "POST" });
+        const json = await res.json();
+
+        if (!res.ok) {
+          setProcessLog((prev) => [...prev, "Fout: " + (json.error || "Onbekende fout")]);
+          break;
+        }
+
+        const d = json.data;
+
+        if (d.status === "completed") {
+          count++;
+          setCompletedCount(count);
+          const steps = (d.stepsCompleted || []).join(" > ");
+          setProcessLog((prev) => [
+            ...prev,
+            `✅ ${d.businessName}: KLAAR! (${steps})`,
+            `   ${d.completedToday}/${d.dailyLimit} vandaag verstuurd`,
+          ]);
+          fetchData();
+        } else if (d.status === "partial") {
+          setProcessLog((prev) => [
+            ...prev,
+            `⚠️ ${d.businessName}: gestopt bij "${d.finalStatus}" (nog niet klaar)`,
+            `   Stappen: ${(d.stepsCompleted || []).join(" > ")}`,
+          ]);
+          fetchData();
+        } else if (d.status === "error") {
+          setProcessLog((prev) => [
+            ...prev,
+            `❌ ${d.businessName || "Onbekend"}: Fout - ${d.error}`,
+            `   Stappen: ${(d.stepsCompleted || []).join(" > ")}`,
+          ]);
+          // Continue to next business despite error
+        } else if (d.status === "idle") {
+          setProcessLog((prev) => [...prev, "Geen bedrijven meer om te verwerken"]);
+          break;
+        } else if (d.status === "limit") {
+          setProcessLog((prev) => [...prev, d.reason]);
+          break;
+        } else if (d.status === "inactive") {
+          setProcessLog((prev) => [...prev, "Engine is niet actief - zet hem aan bij Instellingen"]);
+          break;
+        }
+      } catch {
+        setProcessLog((prev) => [...prev, "Netwerkfout - probeer opnieuw..."]);
+        break;
       }
-      return d.status;
-    } catch {
-      setProcessLog((prev) => [...prev, "Netwerkfout bij verwerken"]);
-      return "error";
     }
+
+    setProcessLog((prev) => [...prev, `Pipeline klaar: ${count} bedrijven volledig verwerkt`]);
+    setProcessing(false);
   }, [fetchData]);
 
-  const startProcessing = useCallback(() => {
-    setProcessing(true);
-    setProcessLog(["Verwerking gestart..."]);
-    setProcessedCount(0);
-
-    // Process immediately, then every 30 seconds
-    const run = async () => {
-      const result = await processNext();
-      if (result === "idle" || result === "limit" || result === "inactive") {
-        setProcessing(false);
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
-      }
-    };
-    run();
-    intervalRef.current = setInterval(run, 30000);
-  }, [processNext]);
-
   const stopProcessing = useCallback(() => {
-    setProcessing(false);
-    setProcessLog((prev) => [...prev, "Verwerking gestopt door gebruiker"]);
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
+    stopRef.current = true;
+    setProcessLog((prev) => [...prev, "Stoppen na huidig bedrijf..."]);
   }, []);
 
   if (loading) {
@@ -198,11 +199,11 @@ export default function PipelinePage() {
         action={
           processing ? (
             <Button variant="danger" onClick={stopProcessing}>
-              Stop verwerking ({processedCount})
+              Stop ({completedCount} klaar)
             </Button>
           ) : (
             <Button variant="primary" onClick={startProcessing}>
-              Verwerken
+              Verwerken (20 bedrijven)
             </Button>
           )
         }
@@ -210,14 +211,14 @@ export default function PipelinePage() {
 
       {processLog.length > 0 && (
         <Card padding="sm" className="mb-4">
-          <div className="max-h-32 overflow-y-auto text-xs font-mono space-y-0.5">
+          <div className="max-h-48 overflow-y-auto text-xs font-mono space-y-0.5">
             {processLog.map((log, i) => (
-              <p key={i} className="text-text-secondary">
+              <p key={i} className={log.startsWith("✅") ? "text-green-600" : log.startsWith("❌") ? "text-red-500" : "text-text-secondary"}>
                 {log}
               </p>
             ))}
             {processing && (
-              <p className="text-primary animate-pulse">Volgende verwerking over 30s...</p>
+              <p className="text-primary animate-pulse">Bezig met verwerken...</p>
             )}
           </div>
         </Card>
@@ -234,7 +235,7 @@ export default function PipelinePage() {
                   <Badge variant="outline">{col.businesses.length}</Badge>
                 </div>
               </div>
-              <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-320px)] pr-1">
+              <div className="flex flex-col gap-3 overflow-y-auto max-h-[calc(100vh-340px)] pr-1">
                 {col.businesses.map((biz) => (
                   <Card key={biz.id} padding="sm">
                     <p className="text-sm font-medium text-text">{biz.name}</p>
